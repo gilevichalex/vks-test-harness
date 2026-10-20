@@ -35,9 +35,10 @@ The keys are stored in `~/.vks-test.env` (mode 600). They never go into the resu
 | cosi-install | CI-1 | COSI controller + CRDs (`v0.2.2`, v1alpha1) and Scality COSI driver `1.0.2` running |
 | cosi-test | CT-1 | BucketClaim → bucket created on RING |
 | | CT-2 | BucketAccess → IAM user + credentials Secret (BucketInfo) |
-| | CT-3 | App pod writes, lists, reads and checksums objects using only the COSI-issued credentials |
-| | CT-4 | A second namespace gets its own bucket; its credentials are denied on the first bucket |
-| | CT-5 | Deleting the BucketAccess revokes the keys |
+| | CT-3 | The application pod published in the reference architecture (`doc-snippets/app-pod.sh`, run verbatim) writes, lists and reads back an object using only the COSI-issued credentials |
+| | CT-3b | A 1 MiB object written, listed, read back and checksummed with the COSI-issued credentials |
+| | CT-4 | A second namespace gets its own bucket; the published isolation check (`doc-snippets/isolation-pod.sh`, run verbatim) is denied on the first bucket |
+| | CT-5 | Deleting the BucketAccess removes its Secret and revokes the keys |
 | | CT-6 | `deletionPolicy: Delete` removes the (empty) bucket with its claim |
 | | CT-7 | `deletionPolicy: Retain` keeps the bucket after its claim is deleted |
 | csi-install (`--with-csi`) | SI-1 | Scality CSI Driver for S3 `2.2.0` running (node DaemonSet + controller) |
@@ -55,6 +56,14 @@ Results land in `/mnt/scality/vks-results/<run>/` (or `~/vks-results/<run>/`) an
 - `screenshots.tsv` (what to capture, and the file names)
 - `evidence/` (every command and its output)
 - `manifests/` (every applied object; Secrets excluded)
+
+## Published snippets
+
+`doc-snippets/` holds byte-for-byte copies of the commands published in the reference architecture. `run.sh` runs them as they are, only renaming the example namespaces and Secrets to this run's names, so a passing CT-3 and CT-4 prove the published steps work. Edit the document first, then re-copy the snippet.
+
+## Cleanup
+
+`--cleanup` deletes application pods, then BucketAccesses, then BucketClaims while the COSI controller and driver are still running, because their finalizers can only be cleared by them. If any remain, it stops before uninstalling the driver and tells you what is left.
 
 ## Kubernetes objects created
 

@@ -371,6 +371,18 @@ cosi_app() {  # cosi_app <ns> <pod> <secret> <script> [ARG1]
       secret: {secretName: $3}"
 }
 
+# doc_snippet <file> <evidence-name>: run a snippet copied verbatim from the public reference
+# architecture (doc-snippets/), mapping its example names onto this run's names. Output -> evidence.
+doc_snippet() {
+  local f="$HERE/doc-snippets/$1" out="$RES/evidence/${CUR_PHASE}--$2.txt"
+  { echo "# doc snippet: doc-snippets/$1 (sha256 $(sha256sum "$f" | cut -c1-12)), names mapped to this run"
+    sed -e "s/app-bucket-b-creds/creds-b/g" -e "s/app-bucket-creds/creds-a/g" \
+        -e "s/bucketclaim app-bucket /bucketclaim claim-a /g" \
+        -e "s/app-team-a/$NS_COSI_A/g" -e "s/app-team-b/$NS_COSI_B/g" "$f" | bash 2>&1
+  } | tee "$out"
+  return "${PIPESTATUS[0]}"
+}
+
 phase_cosi_test() {
   check_token; ensure_tools_ns
   ns_create "$NS_COSI_A"; ns_create "$NS_COSI_B"
@@ -392,20 +404,31 @@ phase_cosi_test() {
     result CT-2 PASS "BucketAccess granted: IAM user created, secret creds-a (BucketInfo) in $NS_COSI_A"
   else result CT-2 FAIL "BucketAccess access-a not granted"; return 1; fi
 
-  # CT-3 app read/write with the COSI-issued credentials
-  if cosi_app "$NS_COSI_A" app-a creds-a cosi-app.sh; then result CT-3 PASS "app pod put/list/get/checksum OK with COSI credentials"
-  else result CT-3 FAIL "app pod failed with COSI credentials"; fi
+  # CT-3 the application pod exactly as published in the reference architecture
+  kubectl -n "$NS_COSI_A" delete pod app-a --ignore-not-found --wait=true >/dev/null
+  doc_snippet app-pod.sh doc-app-pod >/dev/null
+  if grep -q '^hello from VKS$' "$RES/evidence/cosi-test--doc-app-pod.txt"; then
+    result CT-3 PASS "published app pod (doc snippet) wrote, listed and read back an object with COSI credentials"
+  else result CT-3 FAIL "published app pod (doc snippet) did not print 'hello from VKS' (see evidence/cosi-test--doc-app-pod.txt)"; fi
+  # CT-3b larger object with checksum, harness pod
+  if cosi_app "$NS_COSI_A" app-a-checksum creds-a cosi-app.sh; then result CT-3b PASS "1 MiB put/list/get with matching checksum"
+  else result CT-3b FAIL "1 MiB put/get/checksum failed"; fi
   ev resources bash -c "kubectl get bucketclaim,bucketaccess -A; kubectl get bucket"
+  shot 06-ra-app-pod-log.png "Jumphost window: run 'kubectl -n $NS_COSI_A logs app-a' and capture its output (the 3 lines ending 'hello from VKS'). This is Figure 6 of the public reference architecture; keep the endpoint out of the frame if possible."
   shot 03-cosi-bucket-cyberduck.png "On your laptop (Cyberduck/console, account root keys): bucket '$BUCKET_A' with the object(s) under 'cosi-test/' written by the VKS pod."
   shot 04-cosi-k8s-objects.png "Jumphost window: the 'kubectl get bucketclaim,bucketaccess -A' output above."
 
   # CT-4 second namespace, isolation
   if cosi_claim "$NS_COSI_B" claim-b "$P-ret" && cosi_access "$NS_COSI_B" access-b claim-b creds-b; then
     BUCKET_B="$(s3_bucket_of "$NS_COSI_B" claim-b)"
-    if cosi_app "$NS_COSI_B" app-b creds-b cosi-app.sh && cosi_app "$NS_COSI_B" iso-b creds-b cosi-isolation.sh "$BUCKET_A"; then
-      result CT-4 PASS "namespace B has its own bucket $BUCKET_B; its credentials are denied on $BUCKET_A"
-    else result CT-4 FAIL "isolation check failed (see logs app-b / iso-b)"; fi
+    kubectl -n "$NS_COSI_B" delete pod isolation-check --ignore-not-found --wait=true >/dev/null
+    doc_snippet isolation-pod.sh doc-isolation-pod >/dev/null
+    if cosi_app "$NS_COSI_B" app-b creds-b cosi-app.sh \
+       && [[ "$(tail -1 "$RES/evidence/cosi-test--doc-isolation-pod.txt")" == "OK: access denied" ]]; then
+      result CT-4 PASS "namespace B has its own bucket $BUCKET_B; published isolation check (doc snippet): denied on $BUCKET_A"
+    else result CT-4 FAIL "isolation check failed (see evidence/cosi-test--doc-isolation-pod.txt and log app-b)"; fi
   else result CT-4 FAIL "claim-b/access-b not ready"; fi
+  shot 07-ra-isolation-check.png "Jumphost window: run 'kubectl -n $NS_COSI_B logs isolation-check' and capture the 'AccessDenied' line and 'OK: access denied'."
   shot 05-two-buckets-cyberduck.png "On your laptop: bucket list showing both '$BUCKET_A' (namespace $NS_COSI_A) and '$BUCKET_B' (namespace $NS_COSI_B)."
 
   # CT-5 revoke: keep a copy of creds-a, delete the BucketAccess, old keys must stop working
@@ -415,8 +438,9 @@ phase_cosi_test() {
   rm -f "$RES/.creds-a.json"
   kubectl -n "$NS_COSI_A" delete bucketaccess access-a --wait=true
   sleep 15   # let IAM key deletion propagate
-  if cosi_app "$NS_COSI_A" revoked-a creds-a-saved cosi-expect-denied.sh; then
-    result CT-5 PASS "after deleting BucketAccess the old keys are rejected"
+  local gone=0; kubectl -n "$NS_COSI_A" get secret creds-a >/dev/null 2>&1 || gone=1
+  if (( gone )) && cosi_app "$NS_COSI_A" revoked-a creds-a-saved cosi-expect-denied.sh; then
+    result CT-5 PASS "after deleting BucketAccess its Secret is gone and the old keys are rejected"
   else result CT-5 FAIL "old keys still work after BucketAccess deletion"; fi
   kubectl -n "$NS_COSI_A" delete secret creds-a-saved --ignore-not-found >/dev/null
 
@@ -621,6 +645,19 @@ phase_cleanup() {
   CUR_PHASE=cleanup; check_token
   say "Removing test workloads, classes, drivers and test buckets for run $RUN_ID (results bucket $RESULTS_BUCKET is kept)"
   read -r -p "Type 'yes' to continue: " a; [[ $a == yes ]] || die "aborted"
+  # COSI objects carry finalizers that only the controller and driver can clear: delete them in order
+  # (apps, then accesses, then claims) while both are still running, or the namespaces hang in Terminating.
+  local ns stuck=0
+  for ns in "$NS_COSI_A" "$NS_COSI_B"; do
+    kubectl get ns "$ns" >/dev/null 2>&1 || continue
+    kubectl -n "$ns" delete pod --all --wait=true --timeout="$WAIT" >/dev/null
+    kubectl -n "$ns" delete bucketaccess --all --wait=true --timeout="$WAIT" 2>/dev/null || stuck=1
+    kubectl -n "$ns" delete bucketclaim --all --wait=true --timeout="$WAIT" 2>/dev/null || stuck=1
+  done
+  if (( stuck )) || kubectl get bucketaccess,bucketclaim -A --no-headers 2>/dev/null | grep -q .; then
+    kubectl get bucketaccess,bucketclaim -A 2>/dev/null
+    die "COSI objects above did not finish deleting; the driver is left installed so it can finish. Check 'kubectl -n $COSI_NS logs deploy/scality-cosi-driver --all-containers', then re-run ./run.sh --cleanup"
+  fi
   kubectl delete ns "$NS_COSI_A" "$NS_COSI_B" "$NS_CSI" --ignore-not-found --wait=true --timeout="$WAIT" \
     || warn "namespaces still terminating (finalizers) - check 'kubectl get bucketaccess,bucketclaim -A'"
   kubectl delete pv "$P-static-pv" --ignore-not-found
